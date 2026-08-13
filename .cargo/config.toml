@@ -1,0 +1,2 @@
+[alias]
+build-thumbv6m = "build --target thumbv6m-none-eabi --release"

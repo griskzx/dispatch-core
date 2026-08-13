@@ -1,0 +1,25 @@
+[package]
+name = "dispatch-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A small, no_std, table-driven dispatch core"
+documentation = "https://docs.rs/dispatch-core"
+repository = "https://github.com/griskzx/dispatch-core"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["dispatcher", "no-std", "embedded", "middleware", "routing"]
+categories = ["no-std", "embedded", "rust-patterns"]
+publish = ["crates-io"]
+include = [
+    "/src/**",
+    "/examples/**",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/AI_DISCLOSURE.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+]
+
+[dependencies]
