@@ -1,38 +1,60 @@
 #![no_std]
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
-/// A dispatcher that owns the components used to select and wrap a handler.
+use core::{error::Error, fmt};
+
+/// A dispatcher backed by a borrowed table and a matching strategy.
 ///
-/// The dispatch table is supplied for each call, so the dispatcher itself does
-/// not own application data or state. This makes it suitable as a small core
-/// for higher-level abstractions such as a state machine.
-pub struct Dispatcher<M, W> {
+/// The table is scanned from beginning to end. The first matching item is
+/// selected, so table order defines dispatch priority.
+pub struct Dispatcher<'a, Item, M> {
+    table: &'a [Item],
     matcher: M,
-    middleware: W,
 }
 
-impl<M, W> Dispatcher<M, W> {
-    /// Creates a dispatcher from a matcher and middleware.
-    pub const fn new(matcher: M, middleware: W) -> Self {
-        Self {
-            matcher,
-            middleware,
-        }
+impl<'a, Item, M> Dispatcher<'a, Item, M> {
+    /// Creates a dispatcher backed by `table`.
+    pub const fn new(table: &'a [Item], matcher: M) -> Self {
+        Self { table, matcher }
     }
 
-    /// Dispatches an input to the first matching item in `table`.
-    pub fn dispatch<Item, Input, Output, Error>(
-        &mut self,
-        table: &[Item],
-        input: &Input,
-    ) -> Result<Output, DispatchError<Error>>
+    /// Returns the first item accepted by the matcher.
+    ///
+    /// This method performs selection only and does not invoke the item's
+    /// [`Handler`].
+    pub fn select<Input>(&self, input: &Input) -> Option<&Item>
     where
+        Input: ?Sized,
         M: Matcher<Item, Input>,
-        W: Middleware<Item, Input, Output, Error>,
-        Item: Handler<Input = Input, Output = Output, Error = Error>,
     {
-        dispatch(self, table, input)
+        self.table
+            .iter()
+            .find(|item| self.matcher.matches(item, input))
+    }
+
+    /// Selects and executes the first item accepted by the matcher.
+    ///
+    /// `input` is immutable for the entire operation. Runtime state and other
+    /// mutable resources should be carried by `context` instead.
+    pub fn dispatch(
+        &self,
+        input: &Item::Input,
+        context: &mut Item::Context,
+    ) -> Result<Item::Output, DispatchError<Item::Error>>
+    where
+        Item: Handler,
+        M: Matcher<Item, Item::Input>,
+    {
+        let item = self.select(input).ok_or(DispatchError::NotFound)?;
+
+        item.handle(input, context).map_err(DispatchError::Execute)
+    }
+
+    /// Returns the dispatch table.
+    pub const fn table(&self) -> &'a [Item] {
+        self.table
     }
 
     /// Returns a shared reference to the matcher.
@@ -41,23 +63,16 @@ impl<M, W> Dispatcher<M, W> {
     }
 
     /// Returns a mutable reference to the matcher.
+    ///
+    /// This can be used to reconfigure matching between dispatch calls. The
+    /// matcher itself remains immutable while selection is in progress.
     pub fn matcher_mut(&mut self) -> &mut M {
         &mut self.matcher
     }
 
-    /// Returns a shared reference to the middleware.
-    pub const fn middleware(&self) -> &W {
-        &self.middleware
-    }
-
-    /// Returns a mutable reference to the middleware.
-    pub fn middleware_mut(&mut self) -> &mut W {
-        &mut self.middleware
-    }
-
-    /// Splits the dispatcher into its matcher and middleware.
-    pub fn into_parts(self) -> (M, W) {
-        (self.matcher, self.middleware)
+    /// Splits the dispatcher into its table and matcher.
+    pub fn into_parts(self) -> (&'a [Item], M) {
+        (self.table, self.matcher)
     }
 }
 
@@ -67,26 +82,65 @@ pub enum DispatchError<E> {
     /// No item in the table matched the input.
     NotFound,
 
-    /// Middleware rejected the input before the handler ran.
-    Before(E),
-
-    /// The selected handler failed.
+    /// The selected item failed during execution.
     Execute(E),
-
-    /// Middleware failed while processing the handler output.
-    After(E),
 }
 
-/// Selects table items for an input.
-pub trait Matcher<Item, Input> {
+impl<E> fmt::Display for DispatchError<E>
+where
+    E: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("no matching dispatch item"),
+            Self::Execute(error) => write!(formatter, "dispatch handler failed: {error}"),
+        }
+    }
+}
+
+impl<E> Error for DispatchError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::NotFound => None,
+            Self::Execute(error) => Some(error),
+        }
+    }
+}
+
+/// Determines whether an item accepts an input.
+///
+/// Matching receives immutable references and should not produce application
+/// side effects. Stateful matching can still be configured between calls via
+/// [`Dispatcher::matcher_mut`].
+pub trait Matcher<Item, Input: ?Sized> {
     /// Returns `true` when `item` can handle `input`.
     fn matches(&self, item: &Item, input: &Input) -> bool;
 }
 
-/// Handles a dispatched input.
+impl<Item, Input, F> Matcher<Item, Input> for F
+where
+    Input: ?Sized,
+    F: Fn(&Item, &Input) -> bool,
+{
+    fn matches(&self, item: &Item, input: &Input) -> bool {
+        self(item, input)
+    }
+}
+
+/// Executes a selected dispatch-table item.
+///
+/// The input is immutable. Mutable runtime state, services, buffers, or device
+/// handles should be placed in [`Self::Context`]. Implementations that do not
+/// need a context can use `()`.
 pub trait Handler {
     /// Input accepted by the handler.
-    type Input;
+    type Input: ?Sized;
+
+    /// Mutable runtime context used by the handler.
+    type Context: ?Sized;
 
     /// Value produced by the handler.
     type Output;
@@ -94,239 +148,10 @@ pub trait Handler {
     /// Error produced by the handler.
     type Error;
 
-    /// Handles `input` and returns an output.
-    fn handle(&self, input: &Self::Input) -> Result<Self::Output, Self::Error>;
-}
-
-/// Runs logic immediately before and after the selected handler.
-///
-/// The input is immutable because item selection has already happened. This
-/// prevents middleware from invalidating the match. The output remains mutable
-/// so middleware can decorate or normalize successful results.
-pub trait Middleware<Item, Input, Output, Error> {
-    /// Runs after an item is selected and before its handler is called.
-    fn before(&mut self, item: &Item, input: &Input) -> Result<(), Error>;
-
-    /// Runs after the handler succeeds.
-    ///
-    /// This hook is skipped when [`Self::before`] or [`Handler::handle`] fails.
-    fn after(&mut self, item: &Item, input: &Input, output: &mut Output) -> Result<(), Error>;
-}
-
-/// Middleware that performs no work.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct NoopMiddleware;
-
-impl<Item, Input, Output, Error> Middleware<Item, Input, Output, Error> for NoopMiddleware {
-    fn before(&mut self, _item: &Item, _input: &Input) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn after(&mut self, _item: &Item, _input: &Input, _output: &mut Output) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-/// Dispatches `input` to the first matching item in `table`.
-///
-/// Execution order is:
-///
-/// 1. select the first item accepted by the matcher;
-/// 2. call [`Middleware::before`];
-/// 3. call [`Handler::handle`];
-/// 4. call [`Middleware::after`].
-///
-/// Processing stops at the first error. In particular, `after` only runs when
-/// both `before` and the handler succeed.
-pub fn dispatch<M, W, Item, Input, Output, Error>(
-    dispatcher: &mut Dispatcher<M, W>,
-    table: &[Item],
-    input: &Input,
-) -> Result<Output, DispatchError<Error>>
-where
-    M: Matcher<Item, Input>,
-    W: Middleware<Item, Input, Output, Error>,
-    Item: Handler<Input = Input, Output = Output, Error = Error>,
-{
-    let item = table
-        .iter()
-        .find(|item| dispatcher.matcher.matches(item, input))
-        .ok_or(DispatchError::NotFound)?;
-
-    dispatcher
-        .middleware
-        .before(item, input)
-        .map_err(DispatchError::Before)?;
-
-    let mut output = item.handle(input).map_err(DispatchError::Execute)?;
-
-    dispatcher
-        .middleware
-        .after(item, input, &mut output)
-        .map_err(DispatchError::After)?;
-
-    Ok(output)
-}
-
-#[cfg(test)]
-mod tests {
-    use core::cell::Cell;
-
-    use super::*;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum TestError {
-        Before,
-        Execute,
-        After,
-    }
-
-    struct Rule {
-        key: u8,
-        value: u8,
-        fails: bool,
-        calls: Cell<u8>,
-    }
-
-    impl Handler for Rule {
-        type Input = u8;
-        type Output = u8;
-        type Error = TestError;
-
-        fn handle(&self, _input: &Self::Input) -> Result<Self::Output, Self::Error> {
-            self.calls.set(self.calls.get() + 1);
-            if self.fails {
-                Err(TestError::Execute)
-            } else {
-                Ok(self.value)
-            }
-        }
-    }
-
-    struct KeyMatcher;
-
-    impl Matcher<Rule, u8> for KeyMatcher {
-        fn matches(&self, item: &Rule, input: &u8) -> bool {
-            item.key == *input
-        }
-    }
-
-    #[derive(Default)]
-    struct TestMiddleware {
-        fail_before: bool,
-        fail_after: bool,
-        before_calls: u8,
-        after_calls: u8,
-    }
-
-    impl Middleware<Rule, u8, u8, TestError> for TestMiddleware {
-        fn before(&mut self, _item: &Rule, _input: &u8) -> Result<(), TestError> {
-            self.before_calls += 1;
-            if self.fail_before {
-                Err(TestError::Before)
-            } else {
-                Ok(())
-            }
-        }
-
-        fn after(&mut self, _item: &Rule, _input: &u8, output: &mut u8) -> Result<(), TestError> {
-            self.after_calls += 1;
-            if self.fail_after {
-                Err(TestError::After)
-            } else {
-                *output *= 2;
-                Ok(())
-            }
-        }
-    }
-
-    fn rule(key: u8, value: u8) -> Rule {
-        Rule {
-            key,
-            value,
-            fails: false,
-            calls: Cell::new(0),
-        }
-    }
-
-    #[test]
-    fn dispatches_to_the_first_matching_item() {
-        let table = [rule(1, 10), rule(1, 20)];
-        let mut dispatcher = Dispatcher::new(KeyMatcher, TestMiddleware::default());
-
-        let output = dispatcher.dispatch(&table, &1).unwrap();
-
-        assert_eq!(output, 20);
-        assert_eq!(table[0].calls.get(), 1);
-        assert_eq!(table[1].calls.get(), 0);
-        assert_eq!(dispatcher.middleware().before_calls, 1);
-        assert_eq!(dispatcher.middleware().after_calls, 1);
-    }
-
-    #[test]
-    fn returns_not_found_without_running_middleware() {
-        let table = [rule(1, 10)];
-        let mut dispatcher = Dispatcher::new(KeyMatcher, TestMiddleware::default());
-
-        let result = dispatcher.dispatch(&table, &2);
-
-        assert_eq!(result, Err(DispatchError::NotFound));
-        assert_eq!(dispatcher.middleware().before_calls, 0);
-        assert_eq!(dispatcher.middleware().after_calls, 0);
-    }
-
-    #[test]
-    fn stops_when_before_fails() {
-        let table = [rule(1, 10)];
-        let middleware = TestMiddleware {
-            fail_before: true,
-            ..TestMiddleware::default()
-        };
-        let mut dispatcher = Dispatcher::new(KeyMatcher, middleware);
-
-        let result = dispatcher.dispatch(&table, &1);
-
-        assert_eq!(result, Err(DispatchError::Before(TestError::Before)));
-        assert_eq!(table[0].calls.get(), 0);
-        assert_eq!(dispatcher.middleware().after_calls, 0);
-    }
-
-    #[test]
-    fn skips_after_when_handler_fails() {
-        let mut failing_rule = rule(1, 10);
-        failing_rule.fails = true;
-        let table = [failing_rule];
-        let mut dispatcher = Dispatcher::new(KeyMatcher, TestMiddleware::default());
-
-        let result = dispatcher.dispatch(&table, &1);
-
-        assert_eq!(result, Err(DispatchError::Execute(TestError::Execute)));
-        assert_eq!(table[0].calls.get(), 1);
-        assert_eq!(dispatcher.middleware().after_calls, 0);
-    }
-
-    #[test]
-    fn reports_after_errors() {
-        let table = [rule(1, 10)];
-        let middleware = TestMiddleware {
-            fail_after: true,
-            ..TestMiddleware::default()
-        };
-        let mut dispatcher = Dispatcher::new(KeyMatcher, middleware);
-
-        let result = dispatcher.dispatch(&table, &1);
-
-        assert_eq!(result, Err(DispatchError::After(TestError::After)));
-        assert_eq!(table[0].calls.get(), 1);
-    }
-
-    #[test]
-    fn noop_middleware_requires_no_configuration() {
-        let table = [rule(1, 10)];
-        let mut dispatcher = Dispatcher::new(KeyMatcher, NoopMiddleware);
-
-        let output = dispatcher.dispatch(&table, &1).unwrap();
-
-        assert_eq!(output, 10);
-    }
+    /// Handles `input` using `context` and returns an output.
+    fn handle(
+        &self,
+        input: &Self::Input,
+        context: &mut Self::Context,
+    ) -> Result<Self::Output, Self::Error>;
 }

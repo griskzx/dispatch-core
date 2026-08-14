@@ -5,13 +5,14 @@
 [![CI](https://github.com/griskzx/dispatch-core/actions/workflows/ci.yml/badge.svg)](https://github.com/griskzx/dispatch-core/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/dispatch-core.svg)](https://github.com/griskzx/dispatch-core#license)
 
-`dispatch-core` is a small, allocation-free dispatcher designed for `no_std`
-environments. It selects the first matching item from a table and runs it
-through explicit before/after middleware hooks.
+`dispatch-core` is a small, allocation-free, table-driven dispatcher for
+`no_std` environments. It borrows a dispatch table, selects its first matching
+item, and executes that item's handler with an explicit mutable context.
 
-The crate deliberately does not own application state. A higher-level crate
-can build a state machine on top by dispatching `(state, event)` inputs and
-committing the returned next state only after dispatch succeeds.
+The crate deliberately does not provide middleware, application state
+ownership, transactions, asynchronous execution, or dynamic route
+registration. Those policies can be built around the small selection and
+execution core.
 
 ## Installation
 
@@ -19,39 +20,51 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-dispatch-core = "0.1.0"
+dispatch-core = "0.2.0"
 ```
 
 ## Execution model
 
 For each call, the dispatcher:
 
-1. selects the first matching table item;
-2. runs the middleware's `before` hook;
-3. invokes the selected handler;
-4. runs the middleware's `after` hook.
+1. scans the borrowed table from beginning to end;
+2. selects the first item accepted by the matcher;
+3. invokes the selected item's handler;
+4. returns the handler output or a structured error.
 
-Processing stops at the first error. Middleware receives an immutable input,
-so it cannot invalidate a match after selection. The `after` hook can modify a
-successful output.
+Table order defines priority. Matching and input access are immutable. Runtime
+state, services, buffers, and device handles belong in the mutable context.
+Context changes and other side effects are not rolled back when a handler
+returns an error.
 
 ## Example
 
 ```rust
 use core::convert::Infallible;
-use dispatch_core::{Dispatcher, Handler, Matcher, NoopMiddleware};
+use dispatch_core::{Dispatcher, Handler, Matcher};
 
 struct Route {
     command: u8,
     response: u8,
 }
 
+#[derive(Default)]
+struct Context {
+    handled: u8,
+}
+
 impl Handler for Route {
     type Input = u8;
+    type Context = Context;
     type Output = u8;
     type Error = Infallible;
 
-    fn handle(&self, _input: &Self::Input) -> Result<Self::Output, Self::Error> {
+    fn handle(
+        &self,
+        _input: &Self::Input,
+        context: &mut Self::Context,
+    ) -> Result<Self::Output, Self::Error> {
+        context.handled += 1;
         Ok(self.response)
     }
 }
@@ -68,10 +81,57 @@ let routes = [
     Route { command: 1, response: 10 },
     Route { command: 2, response: 20 },
 ];
-let mut dispatcher = Dispatcher::new(CommandMatcher, NoopMiddleware);
+let dispatcher = Dispatcher::new(&routes, CommandMatcher);
+let mut context = Context::default();
 
-assert_eq!(dispatcher.dispatch(&routes, &2), Ok(20));
+assert_eq!(dispatcher.dispatch(&2, &mut context), Ok(20));
+assert_eq!(context.handled, 1);
 ```
+
+Matchers can also be closures:
+
+```rust
+# use core::convert::Infallible;
+# use dispatch_core::{Dispatcher, Handler};
+# struct Route { command: u8 }
+# impl Handler for Route {
+#     type Input = u8;
+#     type Context = ();
+#     type Output = u8;
+#     type Error = Infallible;
+#     fn handle(&self, input: &u8, _context: &mut ()) -> Result<u8, Infallible> {
+#         Ok(*input)
+#     }
+# }
+let routes = [Route { command: 1 }];
+let dispatcher = Dispatcher::new(
+    &routes,
+    |route: &Route, input: &u8| route.command == *input,
+);
+
+assert_eq!(dispatcher.dispatch(&1, &mut ()), Ok(1));
+```
+
+Use [`Dispatcher::select`] when selection is needed without execution.
+
+## Complete example
+
+See [`examples/command_dispatch.rs`](examples/command_dispatch.rs) for a
+complete command router whose table stores handler function pointers. Run it
+with:
+
+```text
+cargo run --example command_dispatch
+```
+
+## Complexity and guarantees
+
+- Selection is a deterministic `O(n)` linear scan.
+- No heap allocation is performed by the crate.
+- The crate has no dependencies and forbids unsafe code.
+- The dispatch table and input are never mutated.
+- The dispatcher only needs a shared reference during dispatch.
+- Handlers that need no runtime context can use `Context = ()`.
 
 ## Embedded build
 
@@ -83,16 +143,6 @@ cargo build-thumbv6m
 
 Normal `cargo build`, `cargo test`, and `cargo clippy` commands use the host
 target, so the test harness remains available.
-
-## Complete example
-
-See [`examples/command_dispatch.rs`](examples/command_dispatch.rs) for a
-complete command-routing example with authorization before the handler and
-output auditing after it succeeds. Run it with:
-
-```text
-cargo run --example command_dispatch
-```
 
 ## Minimum supported Rust version
 

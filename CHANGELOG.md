@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Redesigned `Dispatcher` to borrow its dispatch table at construction time.
+- Added an explicit mutable handler context while keeping dispatch inputs immutable.
+- Made the dispatcher usable through a shared reference during dispatch.
+- Added selection without execution through `Dispatcher::select`.
+- Simplified dispatch errors to selection and execution failures.
+- Added closure support for matchers.
+
+### Removed
+
+- Removed built-in before/after middleware and `NoopMiddleware`.
+- Removed the duplicate free `dispatch` function.
+
 ## [0.1.0] - 2026-08-13
 
 ### Added
