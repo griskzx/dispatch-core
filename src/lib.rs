@@ -9,22 +9,22 @@ use core::{error::Error, fmt};
 ///
 /// The table is scanned from beginning to end. The first matching item is
 /// selected, so table order defines dispatch priority.
-pub struct Dispatcher<'a, Item, M> {
-    table: &'a [Item],
+pub struct Dispatcher<'table, Item, M> {
+    table: &'table [Item],
     matcher: M,
 }
 
-impl<'a, Item, M> Dispatcher<'a, Item, M> {
+impl<'table, Item, M> Dispatcher<'table, Item, M> {
     /// Creates a dispatcher backed by `table`.
-    pub const fn new(table: &'a [Item], matcher: M) -> Self {
+    pub const fn new(table: &'table [Item], matcher: M) -> Self {
         Self { table, matcher }
     }
 
     /// Returns the first item accepted by the matcher.
     ///
-    /// This method performs selection only and does not invoke the item's
-    /// [`Handler`].
-    pub fn select<Input>(&self, input: &Input) -> Option<&Item>
+    /// This method performs selection only. It does not invoke an executor or
+    /// otherwise operate on the selected item.
+    pub fn select<Input>(&self, input: &Input) -> Option<&'table Item>
     where
         Input: ?Sized,
         M: Matcher<Item, Input>,
@@ -34,26 +34,29 @@ impl<'a, Item, M> Dispatcher<'a, Item, M> {
             .find(|item| self.matcher.matches(item, input))
     }
 
-    /// Selects and executes the first item accepted by the matcher.
+    /// Selects an item and delegates execution to `execute`.
     ///
-    /// `input` is immutable for the entire operation. Runtime state and other
-    /// mutable resources should be carried by `context` instead.
-    pub fn dispatch(
+    /// The executor receives the selected item and the original input. It can
+    /// capture arbitrary per-call state and borrowed resources without making
+    /// them part of the dispatcher's type. The executor is not invoked when no
+    /// item matches.
+    pub fn dispatch<'input, Input, Output, ExecuteError, Execute>(
         &self,
-        input: &Item::Input,
-        context: &mut Item::Context,
-    ) -> Result<Item::Output, DispatchError<Item::Error>>
+        input: &'input Input,
+        execute: Execute,
+    ) -> Result<Output, DispatchError<ExecuteError>>
     where
-        Item: Handler,
-        M: Matcher<Item, Item::Input>,
+        Input: ?Sized,
+        M: Matcher<Item, Input>,
+        Execute: FnOnce(&'table Item, &'input Input) -> Result<Output, ExecuteError>,
     {
         let item = self.select(input).ok_or(DispatchError::NotFound)?;
 
-        item.handle(input, context).map_err(DispatchError::Execute)
+        execute(item, input).map_err(DispatchError::Execute)
     }
 
     /// Returns the dispatch table.
-    pub const fn table(&self) -> &'a [Item] {
+    pub const fn table(&self) -> &'table [Item] {
         self.table
     }
 
@@ -71,7 +74,7 @@ impl<'a, Item, M> Dispatcher<'a, Item, M> {
     }
 
     /// Splits the dispatcher into its table and matcher.
-    pub fn into_parts(self) -> (&'a [Item], M) {
+    pub fn into_parts(self) -> (&'table [Item], M) {
         (self.table, self.matcher)
     }
 }
@@ -82,7 +85,7 @@ pub enum DispatchError<E> {
     /// No item in the table matched the input.
     NotFound,
 
-    /// The selected item failed during execution.
+    /// The caller-provided executor failed.
     Execute(E),
 }
 
@@ -93,7 +96,7 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound => formatter.write_str("no matching dispatch item"),
-            Self::Execute(error) => write!(formatter, "dispatch handler failed: {error}"),
+            Self::Execute(error) => write!(formatter, "dispatch execution failed: {error}"),
         }
     }
 }
@@ -116,7 +119,7 @@ where
 /// side effects. Stateful matching can still be configured between calls via
 /// [`Dispatcher::matcher_mut`].
 pub trait Matcher<Item, Input: ?Sized> {
-    /// Returns `true` when `item` can handle `input`.
+    /// Returns `true` when `item` accepts `input`.
     fn matches(&self, item: &Item, input: &Input) -> bool;
 }
 
@@ -128,30 +131,4 @@ where
     fn matches(&self, item: &Item, input: &Input) -> bool {
         self(item, input)
     }
-}
-
-/// Executes a selected dispatch-table item.
-///
-/// The input is immutable. Mutable runtime state, services, buffers, or device
-/// handles should be placed in [`Self::Context`]. Implementations that do not
-/// need a context can use `()`.
-pub trait Handler {
-    /// Input accepted by the handler.
-    type Input: ?Sized;
-
-    /// Mutable runtime context used by the handler.
-    type Context: ?Sized;
-
-    /// Value produced by the handler.
-    type Output;
-
-    /// Error produced by the handler.
-    type Error;
-
-    /// Handles `input` using `context` and returns an output.
-    fn handle(
-        &self,
-        input: &Self::Input,
-        context: &mut Self::Context,
-    ) -> Result<Self::Output, Self::Error>;
 }

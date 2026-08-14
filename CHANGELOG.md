@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-14
+
+### Changed
+
+- Redesigned `Dispatcher::dispatch` to delegate execution to a caller-provided closure.
+- Made execution state and borrowed resources entirely application-defined.
+- Allowed executor outputs to borrow from the selected item or original input.
+
+### Removed
+
+- Removed the `Handler` trait and its fixed input, context, output, and error model.
+
 ## [0.2.0] - 2026-08-14
 
 ### Changed
@@ -33,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - No-op middleware for applications without hooks.
 - Unit tests and a runnable command-dispatch example.
 
-[Unreleased]: https://github.com/griskzx/dispatch-core/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/griskzx/dispatch-core/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/griskzx/dispatch-core/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/griskzx/dispatch-core/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/griskzx/dispatch-core/releases/tag/v0.1.0

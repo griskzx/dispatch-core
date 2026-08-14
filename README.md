@@ -6,13 +6,12 @@
 [![License](https://img.shields.io/crates/l/dispatch-core.svg)](https://github.com/griskzx/dispatch-core#license)
 
 `dispatch-core` is a small, allocation-free, table-driven dispatcher for
-`no_std` environments. It borrows a dispatch table, selects its first matching
-item, and executes that item's handler with an explicit mutable context.
+`no_std` environments. It borrows a table, selects its first matching item,
+and delegates execution to a caller-provided closure.
 
-The crate deliberately does not provide middleware, application state
-ownership, transactions, asynchronous execution, or dynamic route
-registration. Those policies can be built around the small selection and
-execution core.
+The crate defines only the dispatch mechanism. It does not prescribe handler
+traits, context types, middleware stages, application state, transactions,
+asynchronous execution, or dynamic route registration.
 
 ## Installation
 
@@ -20,7 +19,7 @@ Add the crate to your project:
 
 ```toml
 [dependencies]
-dispatch-core = "0.2.0"
+dispatch-core = "0.3.0"
 ```
 
 ## Execution model
@@ -29,44 +28,22 @@ For each call, the dispatcher:
 
 1. scans the borrowed table from beginning to end;
 2. selects the first item accepted by the matcher;
-3. invokes the selected item's handler;
-4. returns the handler output or a structured error.
+3. passes the selected item and original input to the executor closure;
+4. returns the executor output or a structured error.
 
-Table order defines priority. Matching and input access are immutable. Runtime
-state, services, buffers, and device handles belong in the mutable context.
-Context changes and other side effects are not rolled back when a handler
-returns an error.
+Table order defines priority. Matching is immutable. The executor closure can
+capture arbitrary per-call state and borrowed resources, so execution policy
+does not become part of the dispatcher's type.
 
 ## Example
 
 ```rust
 use core::convert::Infallible;
-use dispatch_core::{Dispatcher, Handler, Matcher};
+use dispatch_core::{Dispatcher, Matcher};
 
 struct Route {
     command: u8,
     response: u8,
-}
-
-#[derive(Default)]
-struct Context {
-    handled: u8,
-}
-
-impl Handler for Route {
-    type Input = u8;
-    type Context = Context;
-    type Output = u8;
-    type Error = Infallible;
-
-    fn handle(
-        &self,
-        _input: &Self::Input,
-        context: &mut Self::Context,
-    ) -> Result<Self::Output, Self::Error> {
-        context.handled += 1;
-        Ok(self.response)
-    }
 }
 
 struct CommandMatcher;
@@ -82,37 +59,64 @@ let routes = [
     Route { command: 2, response: 20 },
 ];
 let dispatcher = Dispatcher::new(&routes, CommandMatcher);
-let mut context = Context::default();
+let mut handled = 0_u8;
 
-assert_eq!(dispatcher.dispatch(&2, &mut context), Ok(20));
-assert_eq!(context.handled, 1);
+let response = dispatcher.dispatch(&2, |route, _command| {
+    handled += 1;
+    Ok::<_, Infallible>(route.response)
+});
+
+assert_eq!(response, Ok(20));
+assert_eq!(handled, 1);
 ```
 
 Matchers can also be closures:
 
 ```rust
-# use core::convert::Infallible;
-# use dispatch_core::{Dispatcher, Handler};
-# struct Route { command: u8 }
-# impl Handler for Route {
-#     type Input = u8;
-#     type Context = ();
-#     type Output = u8;
-#     type Error = Infallible;
-#     fn handle(&self, input: &u8, _context: &mut ()) -> Result<u8, Infallible> {
-#         Ok(*input)
-#     }
-# }
+use core::convert::Infallible;
+use dispatch_core::Dispatcher;
+
+struct Route {
+    command: u8,
+}
+
 let routes = [Route { command: 1 }];
 let dispatcher = Dispatcher::new(
     &routes,
-    |route: &Route, input: &u8| route.command == *input,
+    |route: &Route, command: &u8| route.command == *command,
 );
 
-assert_eq!(dispatcher.dispatch(&1, &mut ()), Ok(1));
+let selected_command = dispatcher.dispatch(&1, |_route, command| {
+    Ok::<_, Infallible>(command)
+});
+
+assert_eq!(selected_command, Ok(&1));
 ```
 
 Use [`Dispatcher::select`] when selection is needed without execution.
+
+## Application-defined execution
+
+The executor closure is the extension point for application policy. It can be
+a direct function call:
+
+```text
+dispatcher.dispatch(input, |item, input| item.execute(input))
+```
+
+or an application-specific pipeline:
+
+```text
+dispatcher.dispatch(input, |item, input| {
+    prepare(item, input)?;
+    let output = execute(item, input)?;
+    finish(item, input, &output)?;
+    Ok(output)
+})
+```
+
+The crate does not assign special semantics to those stages. Cleanup,
+rollback, and external side effects remain the caller's responsibility.
 
 ## Complete example
 
@@ -127,11 +131,12 @@ cargo run --example command_dispatch
 ## Complexity and guarantees
 
 - Selection is a deterministic `O(n)` linear scan.
+- The executor runs exactly once when an item matches and never otherwise.
 - No heap allocation is performed by the crate.
 - The crate has no dependencies and forbids unsafe code.
-- The dispatch table and input are never mutated.
-- The dispatcher only needs a shared reference during dispatch.
-- Handlers that need no runtime context can use `Context = ()`.
+- The dispatch table and input are never mutated by the dispatcher.
+- Executors can capture short-lived mutable borrows without stored contexts.
+- Executors can return values borrowed from the table or input.
 
 ## Embedded build
 
