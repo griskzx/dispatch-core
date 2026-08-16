@@ -3,122 +3,133 @@
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+mod after;
+mod before;
 mod command;
 mod error;
 mod handler;
 mod param;
+mod response;
 
+pub use after::{After, AfterFn, AfterHandler, NoAfter};
+pub use before::{Before, BeforeFn, NoBefore};
 pub use command::{
-    CommandEntry, CommandHandler, CommandKey, Dispatcher, KeyMatcher, Matcher, dispatch,
+    CommandEntry, CommandHandler, CommandKey, Dispatcher, KeyMatcher, Matcher, ResponseDispatcher,
+    dispatch,
 };
-pub use error::{DispatchError, FetchError, ParamError};
+pub use error::{DispatchError, DispatchStage, FetchError, ParamError, StageError};
 pub use handler::Handler;
-pub use param::{AccessKind, ResourceAccess, ResourceId, SystemParam};
+pub use param::{
+    AccessKind, DefaultResourceTag, Res, ResMut, ResourceAccess, ResourceId, ResourceProvider,
+    SystemParam,
+};
+pub use response::{IdentityResponse, ResponseFn, ResponseHandler, ResponseStage};
 
 /// Builds a statically dispatchable command entry from a function.
 ///
-/// A command without injected resources only needs its key and function:
+/// The entry declares only the routing relationship. Resource requirements are
+/// inferred from [`Res`] and [`ResMut`] parameters in the function signature.
 ///
 /// ```text
-/// command!(0x01, version)
+/// command!(0x01 => version)
 /// ```
 ///
-/// Resource parameters are listed after a semicolon in the same order as the
-/// function parameters:
-///
-/// ```text
-/// command!(0x02, send; IoMut)
-/// command!(0x03, sign; CryptoRef, IoMut)
-/// ```
-///
-/// The parameter marker types implement [`SystemParam`]. The generated entry
-/// contains only the key and a monomorphized function pointer, so an array of
-/// entries can be stored in read-only memory.
+/// The generated entry contains only the key and a monomorphized function
+/// pointer, so an array of entries can be stored in read-only memory.
 #[macro_export]
 macro_rules! command {
-    ($key:expr, $handler:path $(,)?) => {
+    ($key:expr => $handler:path $(,)?) => {
         $crate::CommandEntry::new($key, |context, resources| {
-            $crate::__private::run_handler::<(), _, _, _, _, _>(
-                $handler, context, resources,
-            )
-        })
-    };
-    ($key:expr, $handler:path; $($param:ty),+ $(,)?) => {
-        $crate::CommandEntry::new($key, |context, resources| {
-            $crate::__private::run_handler::<($($param,)+), _, _, _, _, _>(
-                $handler, context, resources,
-            )
+            $crate::__private::run_handler::<_, _, _, _, _, _>($handler, context, resources)
         })
     };
 }
 
-/// Declares a [`SystemParam`] marker for direct access to a resource field.
+/// Declares an application resource container and its typed field providers.
 ///
-/// Shared and exclusive markers for the same field automatically receive the
-/// same resource identity, allowing the handler to detect conflicting access
-/// before creating references.
+/// Each field type is available through [`Res<T>`](Res) and
+/// [`ResMut<T>`](ResMut). A tag after `=>` distinguishes fields that have the
+/// same type.
 ///
 /// # Examples
 ///
 /// ```
-/// use dispatch_core::resource_param;
+/// use dispatch_core::resources;
 ///
-/// struct Resources {
-///     counter: u32,
+/// struct Primary;
+/// struct Backup;
+///
+/// resources! {
+///     struct Resources {
+///         counter: u32,
+///         primary_port: u16 => Primary,
+///         backup_port: u16 => Backup,
+///     }
 /// }
-///
-/// resource_param!(CounterRef for Resources => counter: u32, shared);
-/// resource_param!(CounterMut for Resources => counter: u32, exclusive);
 /// ```
 ///
-/// The generated implementation is intended for ordinary, non-packed struct
-/// fields. Implement [`SystemParam`] manually when extraction requires a
-/// handle, guard, fallible lookup, or a different access model.
+/// A type may occur only once without a tag. Implement [`ResourceProvider`]
+/// manually when the container already exists or lookup requires a custom
+/// backend.
+///
+/// ```compile_fail
+/// use dispatch_core::resources;
+///
+/// resources! {
+///     struct Ambiguous {
+///         first: u32,
+///         second: u32,
+///     }
+/// }
+/// ```
 #[macro_export]
-macro_rules! resource_param {
-    ($(#[$meta:meta])* $vis:vis $marker:ident for $resources:ty => $field:ident : $item:ty, shared $(,)?) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, Default)]
-        $vis struct $marker;
+macro_rules! resources {
+    (
+        $(#[$container_meta:meta])*
+        $container_vis:vis struct $container:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $field_vis:vis $field:ident : $field_type:ty $(=> $tag:ty)?
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$container_meta])*
+        $container_vis struct $container {
+            $(
+                $(#[$field_meta])*
+                $field_vis $field: $field_type,
+            )*
+        }
 
-        // SAFETY: `ACCESS` and `fetch` are generated from the same field, and
-        // shared access only creates a shared reference.
-        unsafe impl $crate::SystemParam<$resources> for $marker {
-            type Item<'resources> = &'resources $item;
-
-            const ACCESS: $crate::ResourceAccess = $crate::ResourceAccess::shared(
-                $crate::ResourceId::new(::core::mem::offset_of!($resources, $field)),
+        $(
+            $crate::resources!(@provider $container, $field, $field_type $(, $tag)?);
+        )*
+    };
+    (@provider $container:ident, $field:ident, $field_type:ty) => {
+        // SAFETY: the identity and pointer projection are generated from the
+        // same ordinary struct field.
+        unsafe impl $crate::ResourceProvider<$field_type> for $container {
+            const ID: $crate::ResourceId = $crate::ResourceId::new(
+                ::core::mem::offset_of!($container, $field),
             );
 
-            unsafe fn fetch<'resources>(
-                resources: *mut $resources,
-            ) -> ::core::result::Result<Self::Item<'resources>, $crate::FetchError> {
-                // SAFETY: guaranteed by the `SystemParam` implementation
-                // contract and the handler's access-conflict validation.
-                ::core::result::Result::Ok(unsafe { &(*resources).$field })
+            unsafe fn get(resources: *mut Self) -> *mut $field_type {
+                // SAFETY: guaranteed by the `ResourceProvider::get` caller.
+                unsafe { ::core::ptr::addr_of_mut!((*resources).$field) }
             }
         }
     };
-    ($(#[$meta:meta])* $vis:vis $marker:ident for $resources:ty => $field:ident : $item:ty, exclusive $(,)?) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, Copy, Default)]
-        $vis struct $marker;
-
-        // SAFETY: `ACCESS` and `fetch` are generated from the same field, and
-        // the handler rejects every overlapping exclusive access first.
-        unsafe impl $crate::SystemParam<$resources> for $marker {
-            type Item<'resources> = &'resources mut $item;
-
-            const ACCESS: $crate::ResourceAccess = $crate::ResourceAccess::exclusive(
-                $crate::ResourceId::new(::core::mem::offset_of!($resources, $field)),
+    (@provider $container:ident, $field:ident, $field_type:ty, $tag:ty) => {
+        // SAFETY: the identity and pointer projection are generated from the
+        // same ordinary struct field.
+        unsafe impl $crate::ResourceProvider<$field_type, $tag> for $container {
+            const ID: $crate::ResourceId = $crate::ResourceId::new(
+                ::core::mem::offset_of!($container, $field),
             );
 
-            unsafe fn fetch<'resources>(
-                resources: *mut $resources,
-            ) -> ::core::result::Result<Self::Item<'resources>, $crate::FetchError> {
-                // SAFETY: guaranteed by the `SystemParam` implementation
-                // contract and the handler's access-conflict validation.
-                ::core::result::Result::Ok(unsafe { &mut (*resources).$field })
+            unsafe fn get(resources: *mut Self) -> *mut $field_type {
+                // SAFETY: guaranteed by the `ResourceProvider::get` caller.
+                unsafe { ::core::ptr::addr_of_mut!((*resources).$field) }
             }
         }
     };
@@ -130,13 +141,13 @@ macro_rules! resource_param {
 /// contents are not part of the stable API.
 #[doc(hidden)]
 pub mod __private {
-    use crate::{DispatchError, Handler};
+    use crate::{Handler, StageError};
 
     pub fn run_handler<Params, C, R, O, E, H>(
         handler: H,
         context: &mut C,
         resources: &mut R,
-    ) -> Result<O, DispatchError<E>>
+    ) -> Result<O, StageError<E>>
     where
         H: Handler<C, R, O, E, Params>,
     {

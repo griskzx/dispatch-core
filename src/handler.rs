@@ -1,4 +1,4 @@
-use crate::{DispatchError, ParamError, SystemParam, param::validate_accesses};
+use crate::{StageError, SystemParam, param::ParamSet};
 
 /// Adapts a typed command function to a uniform resource-aware invocation.
 ///
@@ -7,15 +7,15 @@ use crate::{DispatchError, ParamError, SystemParam, param::validate_accesses};
 /// applications create the adapter through [`crate::command!`].
 pub trait Handler<C, R, O, E, Params> {
     /// Validates resource access, extracts arguments, and invokes the function.
-    fn run(&self, context: &mut C, resources: &mut R) -> Result<O, DispatchError<E>>;
+    fn run(&self, context: &mut C, resources: &mut R) -> Result<O, StageError<E>>;
 }
 
 impl<C, R, O, E, F> Handler<C, R, O, E, ()> for F
 where
     F: Fn(&mut C) -> Result<O, E>,
 {
-    fn run(&self, context: &mut C, _resources: &mut R) -> Result<O, DispatchError<E>> {
-        self(context).map_err(DispatchError::Command)
+    fn run(&self, context: &mut C, _resources: &mut R) -> Result<O, StageError<E>> {
+        self(context).map_err(StageError::User)
     }
 }
 
@@ -24,35 +24,20 @@ macro_rules! impl_handler {
         impl<C, R, O, E, F, $($param),+> Handler<C, R, O, E, ($($param,)+)> for F
         where
             $($param: SystemParam<R>,)+
+            F: Fn(&mut C, $($param),+) -> Result<O, E>,
             for<'context, 'resources> F:
                 Fn(&'context mut C, $($param::Item<'resources>),+) -> Result<O, E>,
         {
-            fn run<'resources>(
+            fn run(
                 &self,
                 context: &mut C,
-                resources: &'resources mut R,
-            ) -> Result<O, DispatchError<E>> {
-                let accesses = [$($param::ACCESS),+];
-                validate_accesses(&accesses).map_err(DispatchError::Param)?;
+                resources: &mut R,
+            ) -> Result<O, StageError<E>> {
+                let ($($value,)+) =
+                    <($($param,)+) as ParamSet<R>>::fetch(resources)
+                        .map_err(StageError::Param)?;
 
-                let resources = resources as *mut R;
-
-                $(
-                    // SAFETY: the pointer comes from an exclusive borrow that
-                    // lasts for `'resources`, and all declared accesses were
-                    // checked for conflicts before any parameter was fetched.
-                    let $value: $param::Item<'resources> = unsafe {
-                        $param::fetch::<'resources>(resources)
-                    }
-                    .map_err(|error| {
-                        DispatchError::Param(ParamError::Fetch {
-                            index: $index,
-                            error,
-                        })
-                    })?;
-                )+
-
-                self(context, $($value),+).map_err(DispatchError::Command)
+                self(context, $($value),+).map_err(StageError::User)
             }
         }
     };
