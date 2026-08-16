@@ -1,134 +1,145 @@
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
-use core::{error::Error, fmt};
+mod command;
+mod error;
+mod handler;
+mod param;
 
-/// A dispatcher backed by a borrowed table and a matching strategy.
+pub use command::{
+    CommandEntry, CommandHandler, CommandKey, Dispatcher, KeyMatcher, Matcher, dispatch,
+};
+pub use error::{DispatchError, FetchError, ParamError};
+pub use handler::Handler;
+pub use param::{AccessKind, ResourceAccess, ResourceId, SystemParam};
+
+/// Builds a statically dispatchable command entry from a function.
 ///
-/// The table is scanned from beginning to end. The first matching item is
-/// selected, so table order defines dispatch priority.
-pub struct Dispatcher<'table, Item, M> {
-    table: &'table [Item],
-    matcher: M,
-}
-
-impl<'table, Item, M> Dispatcher<'table, Item, M> {
-    /// Creates a dispatcher backed by `table`.
-    pub const fn new(table: &'table [Item], matcher: M) -> Self {
-        Self { table, matcher }
-    }
-
-    /// Returns the first item accepted by the matcher.
-    ///
-    /// This method performs selection only. It does not invoke an executor or
-    /// otherwise operate on the selected item.
-    pub fn select<Input>(&self, input: &Input) -> Option<&'table Item>
-    where
-        Input: ?Sized,
-        M: Matcher<Item, Input>,
-    {
-        self.table
-            .iter()
-            .find(|item| self.matcher.matches(item, input))
-    }
-
-    /// Selects an item and delegates execution to `execute`.
-    ///
-    /// The executor receives the selected item and the original input. It can
-    /// capture arbitrary per-call state and borrowed resources without making
-    /// them part of the dispatcher's type. The executor is not invoked when no
-    /// item matches.
-    pub fn dispatch<'input, Input, Output, ExecuteError, Execute>(
-        &self,
-        input: &'input Input,
-        execute: Execute,
-    ) -> Result<Output, DispatchError<ExecuteError>>
-    where
-        Input: ?Sized,
-        M: Matcher<Item, Input>,
-        Execute: FnOnce(&'table Item, &'input Input) -> Result<Output, ExecuteError>,
-    {
-        let item = self.select(input).ok_or(DispatchError::NotFound)?;
-
-        execute(item, input).map_err(DispatchError::Execute)
-    }
-
-    /// Returns the dispatch table.
-    pub const fn table(&self) -> &'table [Item] {
-        self.table
-    }
-
-    /// Returns a shared reference to the matcher.
-    pub const fn matcher(&self) -> &M {
-        &self.matcher
-    }
-
-    /// Returns a mutable reference to the matcher.
-    ///
-    /// This can be used to reconfigure matching between dispatch calls. The
-    /// matcher itself remains immutable while selection is in progress.
-    pub fn matcher_mut(&mut self) -> &mut M {
-        &mut self.matcher
-    }
-
-    /// Splits the dispatcher into its table and matcher.
-    pub fn into_parts(self) -> (&'table [Item], M) {
-        (self.table, self.matcher)
-    }
-}
-
-/// An error raised while dispatching an input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchError<E> {
-    /// No item in the table matched the input.
-    NotFound,
-
-    /// The caller-provided executor failed.
-    Execute(E),
-}
-
-impl<E> fmt::Display for DispatchError<E>
-where
-    E: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound => formatter.write_str("no matching dispatch item"),
-            Self::Execute(error) => write!(formatter, "dispatch execution failed: {error}"),
-        }
-    }
-}
-
-impl<E> Error for DispatchError<E>
-where
-    E: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::NotFound => None,
-            Self::Execute(error) => Some(error),
-        }
-    }
-}
-
-/// Determines whether an item accepts an input.
+/// A command without injected resources only needs its key and function:
 ///
-/// Matching receives immutable references and should not produce application
-/// side effects. Stateful matching can still be configured between calls via
-/// [`Dispatcher::matcher_mut`].
-pub trait Matcher<Item, Input: ?Sized> {
-    /// Returns `true` when `item` accepts `input`.
-    fn matches(&self, item: &Item, input: &Input) -> bool;
+/// ```text
+/// command!(0x01, version)
+/// ```
+///
+/// Resource parameters are listed after a semicolon in the same order as the
+/// function parameters:
+///
+/// ```text
+/// command!(0x02, send; IoMut)
+/// command!(0x03, sign; CryptoRef, IoMut)
+/// ```
+///
+/// The parameter marker types implement [`SystemParam`]. The generated entry
+/// contains only the key and a monomorphized function pointer, so an array of
+/// entries can be stored in read-only memory.
+#[macro_export]
+macro_rules! command {
+    ($key:expr, $handler:path $(,)?) => {
+        $crate::CommandEntry::new($key, |context, resources| {
+            $crate::__private::run_handler::<(), _, _, _, _, _>(
+                $handler, context, resources,
+            )
+        })
+    };
+    ($key:expr, $handler:path; $($param:ty),+ $(,)?) => {
+        $crate::CommandEntry::new($key, |context, resources| {
+            $crate::__private::run_handler::<($($param,)+), _, _, _, _, _>(
+                $handler, context, resources,
+            )
+        })
+    };
 }
 
-impl<Item, Input, F> Matcher<Item, Input> for F
-where
-    Input: ?Sized,
-    F: Fn(&Item, &Input) -> bool,
-{
-    fn matches(&self, item: &Item, input: &Input) -> bool {
-        self(item, input)
+/// Declares a [`SystemParam`] marker for direct access to a resource field.
+///
+/// Shared and exclusive markers for the same field automatically receive the
+/// same resource identity, allowing the handler to detect conflicting access
+/// before creating references.
+///
+/// # Examples
+///
+/// ```
+/// use dispatch_core::resource_param;
+///
+/// struct Resources {
+///     counter: u32,
+/// }
+///
+/// resource_param!(CounterRef for Resources => counter: u32, shared);
+/// resource_param!(CounterMut for Resources => counter: u32, exclusive);
+/// ```
+///
+/// The generated implementation is intended for ordinary, non-packed struct
+/// fields. Implement [`SystemParam`] manually when extraction requires a
+/// handle, guard, fallible lookup, or a different access model.
+#[macro_export]
+macro_rules! resource_param {
+    ($(#[$meta:meta])* $vis:vis $marker:ident for $resources:ty => $field:ident : $item:ty, shared $(,)?) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, Default)]
+        $vis struct $marker;
+
+        // SAFETY: `ACCESS` and `fetch` are generated from the same field, and
+        // shared access only creates a shared reference.
+        unsafe impl $crate::SystemParam<$resources> for $marker {
+            type Item<'resources> = &'resources $item;
+
+            const ACCESS: $crate::ResourceAccess = $crate::ResourceAccess::shared(
+                $crate::ResourceId::new(::core::mem::offset_of!($resources, $field)),
+            );
+
+            unsafe fn fetch<'resources>(
+                resources: *mut $resources,
+            ) -> ::core::result::Result<Self::Item<'resources>, $crate::FetchError> {
+                // SAFETY: guaranteed by the `SystemParam` implementation
+                // contract and the handler's access-conflict validation.
+                ::core::result::Result::Ok(unsafe { &(*resources).$field })
+            }
+        }
+    };
+    ($(#[$meta:meta])* $vis:vis $marker:ident for $resources:ty => $field:ident : $item:ty, exclusive $(,)?) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, Default)]
+        $vis struct $marker;
+
+        // SAFETY: `ACCESS` and `fetch` are generated from the same field, and
+        // the handler rejects every overlapping exclusive access first.
+        unsafe impl $crate::SystemParam<$resources> for $marker {
+            type Item<'resources> = &'resources mut $item;
+
+            const ACCESS: $crate::ResourceAccess = $crate::ResourceAccess::exclusive(
+                $crate::ResourceId::new(::core::mem::offset_of!($resources, $field)),
+            );
+
+            unsafe fn fetch<'resources>(
+                resources: *mut $resources,
+            ) -> ::core::result::Result<Self::Item<'resources>, $crate::FetchError> {
+                // SAFETY: guaranteed by the `SystemParam` implementation
+                // contract and the handler's access-conflict validation.
+                ::core::result::Result::Ok(unsafe { &mut (*resources).$field })
+            }
+        }
+    };
+}
+
+/// Implementation details used by exported macros.
+///
+/// This module is public only because macros expand in downstream crates. Its
+/// contents are not part of the stable API.
+#[doc(hidden)]
+pub mod __private {
+    use crate::{DispatchError, Handler};
+
+    pub fn run_handler<Params, C, R, O, E, H>(
+        handler: H,
+        context: &mut C,
+        resources: &mut R,
+    ) -> Result<O, DispatchError<E>>
+    where
+        H: Handler<C, R, O, E, Params>,
+    {
+        handler.run(context, resources)
     }
 }
