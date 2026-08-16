@@ -1,134 +1,156 @@
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
-use core::{error::Error, fmt};
+mod after;
+mod before;
+mod command;
+mod error;
+mod handler;
+mod param;
+mod response;
 
-/// A dispatcher backed by a borrowed table and a matching strategy.
+pub use after::{After, AfterFn, AfterHandler, NoAfter};
+pub use before::{Before, BeforeFn, NoBefore};
+pub use command::{
+    CommandEntry, CommandHandler, CommandKey, Dispatcher, KeyMatcher, Matcher, ResponseDispatcher,
+    dispatch,
+};
+pub use error::{DispatchError, DispatchStage, FetchError, ParamError, StageError};
+pub use handler::Handler;
+pub use param::{
+    AccessKind, DefaultResourceTag, Res, ResMut, ResourceAccess, ResourceId, ResourceProvider,
+    SystemParam,
+};
+pub use response::{IdentityResponse, ResponseFn, ResponseHandler, ResponseStage};
+
+/// Builds a statically dispatchable command entry from a function.
 ///
-/// The table is scanned from beginning to end. The first matching item is
-/// selected, so table order defines dispatch priority.
-pub struct Dispatcher<'table, Item, M> {
-    table: &'table [Item],
-    matcher: M,
-}
-
-impl<'table, Item, M> Dispatcher<'table, Item, M> {
-    /// Creates a dispatcher backed by `table`.
-    pub const fn new(table: &'table [Item], matcher: M) -> Self {
-        Self { table, matcher }
-    }
-
-    /// Returns the first item accepted by the matcher.
-    ///
-    /// This method performs selection only. It does not invoke an executor or
-    /// otherwise operate on the selected item.
-    pub fn select<Input>(&self, input: &Input) -> Option<&'table Item>
-    where
-        Input: ?Sized,
-        M: Matcher<Item, Input>,
-    {
-        self.table
-            .iter()
-            .find(|item| self.matcher.matches(item, input))
-    }
-
-    /// Selects an item and delegates execution to `execute`.
-    ///
-    /// The executor receives the selected item and the original input. It can
-    /// capture arbitrary per-call state and borrowed resources without making
-    /// them part of the dispatcher's type. The executor is not invoked when no
-    /// item matches.
-    pub fn dispatch<'input, Input, Output, ExecuteError, Execute>(
-        &self,
-        input: &'input Input,
-        execute: Execute,
-    ) -> Result<Output, DispatchError<ExecuteError>>
-    where
-        Input: ?Sized,
-        M: Matcher<Item, Input>,
-        Execute: FnOnce(&'table Item, &'input Input) -> Result<Output, ExecuteError>,
-    {
-        let item = self.select(input).ok_or(DispatchError::NotFound)?;
-
-        execute(item, input).map_err(DispatchError::Execute)
-    }
-
-    /// Returns the dispatch table.
-    pub const fn table(&self) -> &'table [Item] {
-        self.table
-    }
-
-    /// Returns a shared reference to the matcher.
-    pub const fn matcher(&self) -> &M {
-        &self.matcher
-    }
-
-    /// Returns a mutable reference to the matcher.
-    ///
-    /// This can be used to reconfigure matching between dispatch calls. The
-    /// matcher itself remains immutable while selection is in progress.
-    pub fn matcher_mut(&mut self) -> &mut M {
-        &mut self.matcher
-    }
-
-    /// Splits the dispatcher into its table and matcher.
-    pub fn into_parts(self) -> (&'table [Item], M) {
-        (self.table, self.matcher)
-    }
-}
-
-/// An error raised while dispatching an input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DispatchError<E> {
-    /// No item in the table matched the input.
-    NotFound,
-
-    /// The caller-provided executor failed.
-    Execute(E),
-}
-
-impl<E> fmt::Display for DispatchError<E>
-where
-    E: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound => formatter.write_str("no matching dispatch item"),
-            Self::Execute(error) => write!(formatter, "dispatch execution failed: {error}"),
-        }
-    }
-}
-
-impl<E> Error for DispatchError<E>
-where
-    E: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::NotFound => None,
-            Self::Execute(error) => Some(error),
-        }
-    }
-}
-
-/// Determines whether an item accepts an input.
+/// The entry declares only the routing relationship. Resource requirements are
+/// inferred from [`Res`] and [`ResMut`] parameters in the function signature.
 ///
-/// Matching receives immutable references and should not produce application
-/// side effects. Stateful matching can still be configured between calls via
-/// [`Dispatcher::matcher_mut`].
-pub trait Matcher<Item, Input: ?Sized> {
-    /// Returns `true` when `item` accepts `input`.
-    fn matches(&self, item: &Item, input: &Input) -> bool;
+/// ```text
+/// command!(0x01 => version)
+/// ```
+///
+/// The generated entry contains only the key and a monomorphized function
+/// pointer, so an array of entries can be stored in read-only memory.
+#[macro_export]
+macro_rules! command {
+    ($key:expr => $handler:path $(,)?) => {
+        $crate::CommandEntry::new($key, |context, resources| {
+            $crate::__private::run_handler::<_, _, _, _, _, _>($handler, context, resources)
+        })
+    };
 }
 
-impl<Item, Input, F> Matcher<Item, Input> for F
-where
-    Input: ?Sized,
-    F: Fn(&Item, &Input) -> bool,
-{
-    fn matches(&self, item: &Item, input: &Input) -> bool {
-        self(item, input)
+/// Declares an application resource container and its typed field providers.
+///
+/// Each field type is available through [`Res<T>`](Res) and
+/// [`ResMut<T>`](ResMut). A tag after `=>` distinguishes fields that have the
+/// same type.
+///
+/// # Examples
+///
+/// ```
+/// use dispatch_core::resources;
+///
+/// struct Primary;
+/// struct Backup;
+///
+/// resources! {
+///     struct Resources {
+///         counter: u32,
+///         primary_port: u16 => Primary,
+///         backup_port: u16 => Backup,
+///     }
+/// }
+/// ```
+///
+/// A type may occur only once without a tag. Implement [`ResourceProvider`]
+/// manually when the container already exists or lookup requires a custom
+/// backend.
+///
+/// ```compile_fail
+/// use dispatch_core::resources;
+///
+/// resources! {
+///     struct Ambiguous {
+///         first: u32,
+///         second: u32,
+///     }
+/// }
+/// ```
+#[macro_export]
+macro_rules! resources {
+    (
+        $(#[$container_meta:meta])*
+        $container_vis:vis struct $container:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $field_vis:vis $field:ident : $field_type:ty $(=> $tag:ty)?
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$container_meta])*
+        $container_vis struct $container {
+            $(
+                $(#[$field_meta])*
+                $field_vis $field: $field_type,
+            )*
+        }
+
+        $(
+            $crate::resources!(@provider $container, $field, $field_type $(, $tag)?);
+        )*
+    };
+    (@provider $container:ident, $field:ident, $field_type:ty) => {
+        // SAFETY: the identity and pointer projection are generated from the
+        // same ordinary struct field.
+        unsafe impl $crate::ResourceProvider<$field_type> for $container {
+            const ID: $crate::ResourceId = $crate::ResourceId::new(
+                ::core::mem::offset_of!($container, $field),
+            );
+
+            unsafe fn get(resources: *mut Self) -> *mut $field_type {
+                // SAFETY: guaranteed by the `ResourceProvider::get` caller.
+                unsafe { ::core::ptr::addr_of_mut!((*resources).$field) }
+            }
+        }
+    };
+    (@provider $container:ident, $field:ident, $field_type:ty, $tag:ty) => {
+        // SAFETY: the identity and pointer projection are generated from the
+        // same ordinary struct field.
+        unsafe impl $crate::ResourceProvider<$field_type, $tag> for $container {
+            const ID: $crate::ResourceId = $crate::ResourceId::new(
+                ::core::mem::offset_of!($container, $field),
+            );
+
+            unsafe fn get(resources: *mut Self) -> *mut $field_type {
+                // SAFETY: guaranteed by the `ResourceProvider::get` caller.
+                unsafe { ::core::ptr::addr_of_mut!((*resources).$field) }
+            }
+        }
+    };
+}
+
+/// Implementation details used by exported macros.
+///
+/// This module is public only because macros expand in downstream crates. Its
+/// contents are not part of the stable API.
+#[doc(hidden)]
+pub mod __private {
+    use crate::{Handler, StageError};
+
+    pub fn run_handler<Params, C, R, O, E, H>(
+        handler: H,
+        context: &mut C,
+        resources: &mut R,
+    ) -> Result<O, StageError<E>>
+    where
+        H: Handler<C, R, O, E, Params>,
+    {
+        handler.run(context, resources)
     }
 }

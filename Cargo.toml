@@ -1,9 +1,9 @@
 [package]
 name = "dispatch-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A small, no_std, table-driven dispatch core"
+description = "A no_std command dispatcher with typed resource injection"
 documentation = "https://docs.rs/dispatch-core"
 repository = "https://github.com/griskzx/dispatch-core"
 readme = "README.md"
