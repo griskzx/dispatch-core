@@ -8,18 +8,19 @@ pub enum ParamError {
     Failed,
 }
 
-/// Application context is owned by caller.
+/// A parameter that can be extracted from a resource container.
 pub trait SystemParam<'a, R> {
     type Item;
 
     fn fetch(resources: &'a R) -> Result<Self::Item, ParamError>;
 }
 
-/// Command handler abstraction.
+/// A command execution adapter.
 pub trait Handler<C, R, O, E> {
     fn run(&self, context: &mut C, resources: &R) -> Result<O, E>;
 }
 
+/// Handler with only context argument.
 pub struct Handler0<F>(pub F);
 
 impl<C, R, O, E, F> Handler<C, R, O, E> for Handler0<F>
@@ -31,6 +32,7 @@ where
     }
 }
 
+/// Handler with one injected parameter.
 pub struct Handler1<F, P>(pub F, PhantomData<P>);
 
 impl<C, R, O, E, F, P> Handler<C, R, O, E> for Handler1<F, P>
@@ -39,29 +41,29 @@ where
     for<'a> F: Fn(&mut C, <P as SystemParam<'a, R>>::Item) -> Result<O, E>,
 {
     fn run(&self, context: &mut C, resources: &R) -> Result<O, E> {
-        let p = P::fetch(resources).map_err(|_| panic!())?;
-        (self.0)(context, p)
+        let param = P::fetch(resources).map_err(|_| unreachable!())?;
+        (self.0)(context, param)
     }
 }
 
-/// A static-table command entry.
+/// A command entry suitable for static tables.
 pub struct CommandEntry<C, R, O, E> {
     pub key: u32,
     pub invoke: fn(&mut C, &R) -> Result<O, E>,
 }
 
+/// Dispatch through a borrowed command table.
 pub fn dispatch_table<C, R, O, E>(
     table: &[CommandEntry<C, R, O, E>],
     key: u32,
     context: &mut C,
     resources: &R,
-) -> Result<O, E>
-{
+) -> Option<Result<O, E>> {
     for command in table {
         if command.key == key {
-            return (command.invoke)(context, resources);
+            return Some((command.invoke)(context, resources));
         }
     }
 
-    Err(unsafe { core::mem::zeroed() })
+    None
 }
